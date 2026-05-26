@@ -12,7 +12,7 @@
 **AVTR-1** is a flow-matching-based autoregressive model for live dialogue. Given a portrait image and dual-stream audio, it renders lip-synced speech and active listening at 25 fps on a single GPU. Built for production deployment: model weights, TensorRT-accelerated inference, and the live-session backend - available as an API or fully self-hosted
 
 <div align="center">
-  <video src="https://github.com/user-attachments/assets/7aa2c14f-64e8-469f-bfa0-866c4a0813dd" muted=false width="50%"/>
+  <video src="https://github.com/user-attachments/assets/5e4f96af-973a-4aa4-a8be-e0ce6f44a5d1" muted=false width="50%"></video>
 </div>
 
 ---
