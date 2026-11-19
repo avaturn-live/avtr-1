@@ -99,6 +99,9 @@ class SpeechScheduler:
             future_duration + present_duration, sample_rate
         )
         self._buffer = SpeechBuffer.empty()
+        # A in Algorithm 2: audio that the current step admitted but did not commit to B yet.
+        # It is state, not a local, so that Interrupt can clear it while Step waits on R3.
+        self._pending: list[SpeechBuffer] = []
 
         self._event_queue = deque[TimestampedEvent]()
         self._next_present_timestamp = Fraction(denominator=sample_rate)
@@ -121,6 +124,20 @@ class SpeechScheduler:
             media=Fraction(self._clocks.now),
             wall=self._clocks.now_wall,
             clock_started=self._clocks.started,
+        )
+
+    @property
+    def _pending_duration(self) -> Fraction:
+        return sum((b.duration for b in self._pending), Fraction(0))
+
+    @property
+    def _room(self) -> Fraction:
+        """room(B, A) in Algorithm 2. The value is negative when the last fragment overshoots."""
+        return (
+            self.present_duration
+            + self.future_duration
+            - self._buffer.duration
+            - self._pending_duration
         )
 
     @property
@@ -224,9 +241,10 @@ class SpeechScheduler:
         self._fragment_arrivals.pop(segment_id, None)
 
     async def interrupt(self):
-        self._buffer = self._buffer.slice(
-            0, self.future_duration
-        )  # Drop overage as it will not be played back
+        # Algorithm 2, line 21: B <- B[0, T_future) and A <- {}. Step can wait on R3 with A partly
+        # filled. A is not committed yet, so it is discarded together with the overage of B.
+        self._buffer = self._buffer.slice(0, self.future_duration)
+        self._pending = []
 
         new_queue = deque[SpeechBuffer | SegmentEvent]()
 
@@ -315,7 +333,6 @@ class SpeechScheduler:
         await self._append_queue(SegmentEnded(segment_id))
 
     async def do_step(self) -> _StepResult:
-        bufs = list[SpeechBuffer]()
         new_events = list[TimestampedEvent]()
         is_segment_start = False
 
@@ -324,44 +341,45 @@ class SpeechScheduler:
         lookahead = self._buffer.duration
         started_segment: str | None = None
 
-        # Buffer can already contain enough because of last chunk size
-        duration_to_consume = max(
-            0, (self.present_duration + self.future_duration) - self._buffer.duration
-        )
-        consumed_duration = 0
+        # A <- {} (Algorithm 2, line 2). The buffer can already hold enough audio because the last
+        # fragment of the previous step overshot, so the loop below can run zero times.
+        self._pending = []
 
-        # Consume queue until we have enough duration or until we hit
-        while duration_to_consume > 0:
+        while self._room > 0:
             if len(self._queue) == 0:
                 if self._active_segment is None or is_segment_start:
-                    # Stop as we can pad it to the left or to the right
+                    # No segment, or a segment that starts in this step: do not wait, pad instead.
                     break
 
-                # Block and wait for new arrivals to the queue if we are midsegment
-                async with self._new_arrival:
-                    await self._new_arrival.wait()
+                # R3: mid-segment, wait for the next fragment. Interrupt can run during this wait.
+                # It clears A and B's overage and puts the end marker into the queue.
+                while len(self._queue) == 0:
+                    async with self._new_arrival:
+                        await self._new_arrival.wait()
 
             item = self._queue.popleft()
             if isinstance(item, SegmentStarted):
-                timestamp = self._next_event_timestamp + consumed_duration
+                timestamp = self._next_event_timestamp + self._pending_duration
                 new_events.append(TimestampedEvent(item, timestamp))
                 self._active_segment = item.id
                 is_segment_start = True
                 self._active_segment_start = timestamp
                 started_segment = item.id
             elif isinstance(item, SegmentEnded):
-                timestamp = self._next_event_timestamp + consumed_duration
+                timestamp = self._next_event_timestamp + self._pending_duration
                 new_events.append(TimestampedEvent(item, timestamp))
                 # An interrupt queues SegmentEnded ahead of SegmentInterrupted, and playback
                 # actually stops at the former. Measure here, attach when SegmentInterrupted is
                 # admitted on a later step.
                 if self._interrupt_arrival is not None and item.id == self._interrupt_ended_segment:
+                    # B as it is now, not `lookahead`: when Interrupt ran during the R3 wait of
+                    # this step, it cut B after the step started. Otherwise the two are equal.
                     self._pending_interrupt_latencies = self._build_latencies(
                         "interruption",
                         self._interrupt_arrival,
                         step_media,
                         present_start,
-                        lookahead,
+                        self._buffer.duration,
                         Fraction(0),
                         timestamp,
                         no_fragment_at_admit=False,
@@ -370,13 +388,10 @@ class SpeechScheduler:
                     self._interrupt_ended_segment = None
                 self._forget_segment(item.id)
                 self._active_segment = None
-                # We don't want to end one segment and start another in the same step because we
-                # will not be able to pad left or right if there is not enough data
+                # R5: do not end one segment and start another in the same step.
                 break
             elif isinstance(item, SpeechBuffer):
-                bufs.append(item)
-                duration_to_consume -= item.duration
-                consumed_duration += item.duration
+                self._pending.append(item)
             else:
                 latencies = None
                 if isinstance(item, SegmentInterrupted):
@@ -386,37 +401,36 @@ class SpeechScheduler:
                     self._forget_segment(item.id)
                 self._event_queue.append(
                     TimestampedEvent(
-                        item, self._next_event_timestamp + consumed_duration, latencies
+                        item, self._next_event_timestamp + self._pending_duration, latencies
                     )
                 )
 
-        # Now we are in one of three situations:
-        # 1. We have too little duration in started segment , we need to add silence either on the left if it's a segment start or on the right if it's a segment end
-        # 2. We have too much duration because the last chunk was too long (it's ok, we keep it in present+future buffer)
-        # 3. We have the exact duration we need
-        # PS If duration is too little but midsegment -- we already blocked and waited above
-
+        # Now one of three cases holds:
+        # 1. Room is left. A segment that starts in this step and is still active is padded on the
+        #    left (R2, Algorithm 2 line 15). Otherwise no segment is active, also when a segment
+        #    starts and ends in this step, and the window is padded on the right (R4). A complete
+        #    segment needs no left pad: no later fragment can leave a gap after it. Mid-segment,
+        #    the R3 wait above already filled the room.
+        # 2. Room is negative because the last fragment overshot. The overage stays in B for the
+        #    next step and is not sent as future.
+        # 3. Room is exactly zero.
+        room = self._room
         t_pad = Fraction(0)
-        if duration_to_consume > 0:
-            pad = self._max_padding_buffer.slice(0, duration_to_consume)
-            if self._active_segment is None:
-                # We either don't have current active segment and pad it right
-                pad_left, pad_right = [], [pad]
-            elif is_segment_start:
-                # Or we just started segment and didn't have enough of it so we pad it left
-                pad_left, pad_right = [pad], []
+        pad_left: list[SpeechBuffer] = []
+        pad_right: list[SpeechBuffer] = []
+        if room > 0:
+            pad = self._max_padding_buffer.slice(0, room)
+            if is_segment_start and self._active_segment is not None:
+                pad_left = [pad]
                 t_pad = pad.duration
-
-                # We need to shift event timestamps right
+                # The pad goes before the segment, so all of this step's events move right.
                 new_events = [
                     TimestampedEvent(i.event, i.timestamp + pad.duration) for i in new_events
                 ]
+            elif self._active_segment is None:
+                pad_right = [pad]
             else:
-                # In other cases we
-                raise Exception("Should never get here")
-        else:  # duration_to_consume == 0 or duration_to_consume < 0
-            # If it's negative -- we keep overage in self._buffer, but we don't send it as future
-            pad_left, pad_right = [], []
+                raise AssertionError("Mid-segment step ended with room left after the R3 wait")
 
         if started_segment is not None:
             new_events = self._attach_turn_start_latencies(
@@ -429,7 +443,8 @@ class SpeechScheduler:
             )
 
         self._event_queue.extend(new_events)
-        self._buffer = SpeechBuffer.concat([self._buffer, *pad_left, *bufs, *pad_right])
+        self._buffer = SpeechBuffer.concat([self._buffer, *pad_left, *self._pending, *pad_right])
+        self._pending = []
 
         self._next_present_timestamp += self.present_duration
         present, self._buffer = self._buffer.split_in_two_parts_with_duration(self.present_duration)

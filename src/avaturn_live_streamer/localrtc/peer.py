@@ -19,11 +19,12 @@ from typing import Literal
 import av
 import numpy as np
 from aiortc import MediaStreamTrack, RTCPeerConnection
+from aiortc.codecs.vpx import Vp8Encoder
 from aiortc.mediastreams import MediaStreamError
 from av.frame import Frame as AvFrame
 
-from avaturn_live_streamer.core.logs import get_logger
 from avaturn_live_streamer import constant
+from avaturn_live_streamer.core.logs import get_logger
 from avaturn_live_streamer.speech.speech_buffer import SpeechBuffer
 
 _LOGGER = get_logger()
@@ -89,6 +90,28 @@ class _QueuedAudioTrack(MediaStreamTrack):
             self.stop()
             raise ConnectionError("audio track closed")
         return frame
+
+
+class _FixedBitrateVp8Encoder(Vp8Encoder):
+    """VP8 encoder that ignores bitrate changes from congestion control.
+
+    aiortc builds a new libvpx encoder each time the target bitrate changes by more than 10 %.
+    Building one, with its first keyframe, holds the GIL for 40-100 ms, so the event loop stalls
+    for that time. With a fixed bitrate, the encoder is built once, at the first frame.
+    """
+
+    def __init__(self, bitrate: int) -> None:
+        super().__init__()
+        self._fixed_bitrate = bitrate
+        self._Vp8Encoder__target_bitrate = bitrate  # read by the encoder options (bufsize)
+
+    @property
+    def target_bitrate(self) -> int:
+        return self._fixed_bitrate
+
+    @target_bitrate.setter
+    def target_bitrate(self, bitrate: int) -> None:
+        pass  # Keep the fixed bitrate.
 
 
 class LocalRTC:
@@ -180,6 +203,24 @@ class LocalRTC:
                         f"before reaching 'connected'"
                     )
                 await self.wait_state_change()
+
+    def fix_video_bitrate(self, bitrate: int) -> None:
+        """Send VP8 at a fixed bitrate, without congestion control. For measurement runs only.
+
+        Call after SDP negotiation and before the first video frame. The interactive demo does not
+        call it, so it keeps the adaptive bitrate. Raises RuntimeError if VP8 was not negotiated.
+        """
+        for transceiver in self.pc.getTransceivers():
+            if transceiver.sender.track is not self._video_track:
+                continue
+            codecs = transceiver._codecs  # negotiated codecs, preferred first (aiortc internal)
+            if not codecs or codecs[0].mimeType.lower() != "video/vp8":
+                raise RuntimeError(f"fix_video_bitrate needs VP8, negotiated: {codecs[:1]}")
+            # aiortc creates the encoder at the first frame only when none is set.
+            transceiver.sender._RTCRtpSender__encoder = _FixedBitrateVp8Encoder(bitrate)
+            _LOGGER.info("localrtc VP8 bitrate fixed", bitrate=bitrate)
+            return
+        raise RuntimeError("fix_video_bitrate: no video sender")
 
     async def push_video_frame(self, frame: av.VideoFrame) -> None:
         await self._video_track.push(frame)

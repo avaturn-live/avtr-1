@@ -40,18 +40,30 @@ class StreamClocks:
         self._started.set()
 
     async def wakeup_at(self, time: float):
+        """Sleep until `now >= time` on the media clock.
+
+        A late frame can shift the clock back (delta in Algorithm 1) while this coroutine sleeps.
+        A sleep computed once then ends early on the media clock. So sleep again for the rest,
+        until the media clock reaches `time`.
+        """
         await self._started.wait()
         cn = self.now
-        sleep_for = time - cn
-        if sleep_for < 0:
-            _LOGGER.warning(
-                "StreamClock: negative sleep sleep_for=%.4f delays=%.4f compensated_now=%.4f",
-                sleep_for,
-                self._total_delay,
-                cn,
-            )
+        remaining = time - cn
+        if remaining <= 0:
+            if remaining < 0:
+                _LOGGER.warning(
+                    "StreamClock: negative sleep sleep_for=%.4f delays=%.4f compensated_now=%.4f",
+                    remaining,
+                    self._total_delay,
+                    cn,
+                )
+            # Already due: still yield once to the event loop, as before.
+            await asyncio.sleep(0)
+            return
 
-        await asyncio.sleep(max(sleep_for, 0))
+        while remaining > 0:
+            await asyncio.sleep(remaining)
+            remaining = time - self.now
 
     @property
     def now(self):

@@ -41,6 +41,7 @@ from avaturn_live_streamer.renderer.interface import (
     RendererRequest,
 )
 from avaturn_live_streamer.renderer.models import (
+    RenderingModelDurations,
     get_model_default_extra_params,
     get_model_durations,
 )
@@ -122,6 +123,12 @@ class RenderingWorklet:
     _renderer_registry: RendererClientRegistry
     _config: RendererConfig
     _segment_metadata: dict[SegmentId, SegmentMetadata] = Factory(dict)
+    # Timing override, e.g. for a mock renderer with another N, T_future or T_lead.
+    # None: the timing of the configured model.
+    _durations: RenderingModelDurations | None = None
+
+    def _get_durations(self) -> RenderingModelDurations:
+        return self._durations or get_model_durations(self._config.model)
 
     @async_log_entry_exit
     async def run(self, bus: EventBus, clocks: StreamClocks) -> None:
@@ -129,7 +136,7 @@ class RenderingWorklet:
         Create schedulers, launch rendering loop as background task,
         then handle events in main loop.
         """
-        durations = get_model_durations(self._config.model)
+        durations = self._get_durations()
         speech_scheduler = SpeechScheduler(
             sample_rate=constant.NATIVE_SPEECH_SAMPLE_RATE,
             present_duration=durations.present,
@@ -217,7 +224,7 @@ class RenderingWorklet:
         """Main rendering loop."""
         state = None
         next_ts = Fraction()
-        durations = get_model_durations(self._config.model)
+        durations = self._get_durations()
         internal_config = _convert_config(self._config)
         renderer = self._renderer_registry.get_renderer(self._config.model)
 
@@ -293,7 +300,7 @@ class RenderingWorklet:
                 bus, renderer, state, next_ts, internal_config, step_result, user_chunk
             )
 
-            start_next_render_at = float(max(next_ts - durations.present / 2, clocks.now))
+            start_next_render_at = float(max(next_ts - durations.lead, clocks.now))
             sleep_for = start_next_render_at - clocks.now
 
             _METRIC_RENDER_SLEEP_FOR.record(sleep_for, _render_metric_attributes())

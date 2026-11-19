@@ -20,8 +20,17 @@ def public_model_name_to_model_name(name: PublicModelName) -> ModelName:
 
 @attrs.define
 class RenderingModelDurations:
+    """Timing of one renderer, as the streamer uses it.
+
+    present: T_present, the audio one request turns into frames (N frames of FRAME_DURATION).
+    future: T_future, the lookahead audio a request needs after its present window.
+    lead: T_lead, the rendering loop issues each request this long before its present window
+        plays. It must cover the renderer's time to first frame.
+    """
+
     present: Fraction
     future: Fraction
+    lead: Fraction
 
 
 _DURATION_BY_MODEL: dict[ModelName, RenderingModelDurations] = {
@@ -29,6 +38,7 @@ _DURATION_BY_MODEL: dict[ModelName, RenderingModelDurations] = {
         present=FRAME_DURATION * 5,
         # 2 frames + 80 samples in 16kHz
         future=FRAME_DURATION * 5 + Fraction(80, RENDERER_SPEECH_SAMPLE_RATE),
+        lead=Fraction(100, 1000),
     ),
 }
 

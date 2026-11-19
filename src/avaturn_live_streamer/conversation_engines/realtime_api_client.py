@@ -236,6 +236,12 @@ class RealtimeApiClient:
                     chunk = await run_in_thread(self._decode_chunk, msg["delta"])
 
                     if not conv_items_started_by_id.get(item_id):
+                        # A cancelled response sends no output_audio.done, so its segment can still
+                        # be open. Close it first: the scheduler accepts one open segment, and it
+                        # would drop every chunk of this item otherwise.
+                        for open_id in list(conv_items_started_by_id):
+                            await bus.publish(SegmentGenerationCompleted(segment_id=open_id))
+                            del conv_items_started_by_id[open_id]
                         conv_items_started_by_id[item_id] = True
                         await bus.publish(SegmentGenerationStarted(segment_id=item_id))
 
@@ -247,6 +253,11 @@ class RealtimeApiClient:
                         del conv_items_started_by_id[item_id]
                 case "input_audio_buffer.speech_started":
                     _LOGGER.info("Speech interrupted")
+                    # As in the Cartesia client: Completed before Discard, so the scheduler
+                    # releases the write-active segment before the next response starts.
+                    for open_id in list(conv_items_started_by_id):
+                        await bus.publish(SegmentGenerationCompleted(segment_id=open_id))
+                        del conv_items_started_by_id[open_id]
                     await bus.publish(DiscardAvatarSpeechBuffer())
                 case "conversation.item.input_audio_transcription.completed":
                     item_id = msg.get("item_id")

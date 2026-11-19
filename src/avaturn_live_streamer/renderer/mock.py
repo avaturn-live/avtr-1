@@ -32,10 +32,26 @@ from avaturn_live_streamer.utils.async_utils import aiotime
 _LOGGER = get_logger()
 
 
+def _rgb_to_i420(image: NDArray) -> NDArray:
+    """Convert one (H, W, 3) uint8 RGB image to flat I420 bytes (BT.601, as cv2.COLOR_RGB2YUV_I420).
+
+    numpy only, so the mock renderer runs in the streamer env, which has no OpenCV.
+    """
+    rgb = image.astype(np.float32)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    u = (b - y) * 0.564 + 128.0
+    v = (r - y) * 0.713 + 128.0
+    # 2x2 chroma subsampling by averaging.
+    h, w = y.shape
+    u = u.reshape(h // 2, 2, w // 2, 2).mean(axis=(1, 3))
+    v = v.reshape(h // 2, 2, w // 2, 2).mean(axis=(1, 3))
+    planes = [np.clip(np.rint(p), 0, 255).astype(np.uint8).ravel() for p in (y, u, v)]
+    return np.concatenate(planes)
+
+
 @lru_cache(maxsize=1)
 def _make_frames(config: RenderConfig) -> NDArray:
-    import cv2
-
     timestamps = np.linspace(0, 4, num=100, endpoint=False)
     num_frames = len(timestamps)
 
@@ -55,10 +71,7 @@ def _make_frames(config: RenderConfig) -> NDArray:
     else:
         raise ValueError(f"Unknown pixel format: {config.pixel_format}")
 
-    yuv_frames = [
-        cv2.cvtColor(images[i, :, :, :3], cv2.COLOR_RGB2YUV_I420) for i in range(num_frames)
-    ]
-    return np.array(yuv_frames)
+    return np.array([_rgb_to_i420(images[i]) for i in range(num_frames)])
 
 
 def _mock_render(request: RendererRequest) -> RenderResponse:
@@ -100,6 +113,15 @@ def const_frame_time_source(frame_number: int) -> float:
     ttff = 0.05
     mtbf = 0.017
     return ttff if frame_number == 0 else mtbf
+
+
+def fixed_frame_times(ttff: float, mtbf: float) -> Callable[[int], float]:
+    """Timing source: the first frame after `ttff` seconds, each later frame `mtbf` seconds later."""
+
+    def source(frame_number: int) -> float:
+        return ttff if frame_number == 0 else mtbf
+
+    return source
 
 
 def random_frame_time_source(frame_number: int) -> float:

@@ -59,6 +59,8 @@ def _build_video_frame(buffer: bytes, pixel_format: PixelFormat) -> av.VideoFram
 class LocalRTCWorklet:
     _peer: LocalRTC
     _pixel_format: PixelFormat
+    # False: never publish user speech from the peer, e.g. when a scripted user provides it.
+    _read_user_audio: bool = True
 
     @async_log_entry_exit
     async def run(self, bus: EventBus, clocks: StreamClocks) -> None:
@@ -71,13 +73,18 @@ class LocalRTCWorklet:
         async with TaskGroup() as tg:
             main_task = tg.create_task(self._video_to_peer_worker(bus.clone(), clocks))
             lifecycle_task = tg.create_task(self._participant_lifecycle_worker(bus.clone()))
-            user_audio_task = tg.create_task(self._read_user_audio_loop(bus, clocks))
+            user_audio_task = (
+                tg.create_task(self._read_user_audio_loop(bus, clocks))
+                if self._read_user_audio
+                else None
+            )
             bus.ready()
 
             await bus.publish(ParticipantJoined(participant_id="local"))
 
             await main_task
-            await cancel_and_wait_completion(user_audio_task)
+            if user_audio_task is not None:
+                await cancel_and_wait_completion(user_audio_task)
             # The lifecycle worker only exits on a peer state change; on a
             # bus-driven shutdown (timeout, etc.) it would block the TaskGroup
             # forever, preventing peer.close() upstream — which in turn keeps
@@ -126,7 +133,8 @@ class LocalRTCWorklet:
 
                 n_frame += 1
 
-                next_frame_work_should_be_ready_at = frame.timestamp + FRAME_DURATION - 0.001
+                # Algorithm 1, Send: the next frame is late only when now > its timestamp.
+                next_frame_work_should_be_ready_at = frame.timestamp + FRAME_DURATION
 
                 async with clocks.measure_delay_after_deadline(
                     next_frame_work_should_be_ready_at
